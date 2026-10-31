@@ -1,0 +1,15 @@
+LearnMateAI/
+│
+├── app.py
+├── learner.py
+├── quiz.py
+├── ai_tutor.py
+├── adaptive_engine.py
+├── graph_memory.py
+├── database.py
+├── requirements.txt
+├── .env
+├── .gitignore
+│
+└── data/
+    └── learner.db
