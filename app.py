@@ -1,806 +1,1640 @@
 
+import os
+import re
+import json
+import hmac
+import hashlib
+import secrets
+import smtplib
+import ssl
+from datetime import datetime, timedelta
+from email.message import EmailMessage
+
 import streamlit as st
+import pandas as pd
+from dotenv import load_dotenv
+from google import genai
 
-from database import (
-    init_db,
-    save_student,
-    get_student,
-    save_quiz_result,
-    get_quiz_results,
-    save_tutor_question,
-    get_tutor_questions,
-    get_latest_study_plan
-)
+import database as db
+from gemini_helper import generate_ai_response
 
-from ai_tutor import (
-    get_tutor_response,
-    generate_study_plan
-)
+# ==================================================
+# CONFIGURATION
+# ==================================================
 
-
-# ==========================================
-# 1. PAGE CONFIGURATION
-# ==========================================
+load_dotenv()
 
 st.set_page_config(
     page_title="LearnMate AI",
-    page_icon="📚",
+    page_icon="🎓",
     layout="wide"
 )
 
-# Initialize database
-init_db()
+db.init_db()
+
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_EMAIL = os.getenv("SMTP_EMAIL", "")
+SMTP_APP_PASSWORD = os.getenv("SMTP_APP_PASSWORD", "")
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "").strip().lower()
+OTP_HASH_SECRET = os.getenv("OTP_HASH_SECRET", "change-this-secret")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 
-# ==========================================
-# 2. SESSION STATE
-# ==========================================
+SUBJECTS = [
+    "Mathematics",
+    "Engineering Mathematics",
+    "Discrete Mathematics",
+    "Physics",
+    "Chemistry",
+    "Computer Science",
+    "Python Programming",
+    "Java Programming",
+    "C Programming",
+    "C++ Programming",
+    "Data Structures and Algorithms",
+    "DBMS",
+    "Operating Systems",
+    "Computer Networks",
+    "Software Engineering",
+    "Artificial Intelligence",
+    "Machine Learning",
+    "Web Development",
+    "Computer Organization and Architecture",
+    "Digital Logic Design",
+    "English",
+    "Aptitude and Logical Reasoning",
+    "Environmental Science",
+    "Other"
+]
 
-if "student_email" not in st.session_state:
-    st.session_state.student_email = ""
 
-if "generated_study_plan" not in st.session_state:
-    st.session_state.generated_study_plan = ""
+# ==================================================
+# SESSION STATE
+# ==================================================
 
-if "last_quiz_score" not in st.session_state:
-    st.session_state.last_quiz_score = None
+if "logged_in" not in st.session_state:
+    st.session_state.logged_in = False
+
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if "register_otp_sent" not in st.session_state:
+    st.session_state.register_otp_sent = False
+
+if "forgot_otp_sent" not in st.session_state:
+    st.session_state.forgot_otp_sent = False
 
 
-# ==========================================
-# 3. SIDEBAR NAVIGATION
-# ==========================================
+# ==================================================
+# COMMON FUNCTIONS
+# ==================================================
 
-st.sidebar.title("📚 LearnMate AI")
+def normalize_email(email):
+    return email.strip().lower()
 
-st.sidebar.caption(
-    "Your Personal Adaptive Exam Tutor"
-)
 
-page = st.sidebar.radio(
-    "Choose a Page",
-    [
-        "Home",
-        "Student Registration",
-        "Diagnostic Quiz",
-        "Learning Dashboard",
-        "AI Tutor",
-        "AI Study Planner"
-    ]
-)
+def record_activity(activity, details=""):
 
-st.sidebar.divider()
-
-st.sidebar.subheader("Student Login")
-
-login_email = st.sidebar.text_input(
-    "Enter Registered Email",
-    value=st.session_state.student_email
-)
-
-if st.sidebar.button("Load Student"):
-
-    if login_email.strip():
-
-        student_record = get_student(
-            login_email.strip()
+    if st.session_state.user:
+        db.log_activity(
+            st.session_state.user["email"],
+            activity,
+            details
         )
 
-        if student_record:
 
-            st.session_state.student_email = login_email.strip()
-            st.session_state.generated_study_plan = ""
+def is_admin():
 
-            st.sidebar.success(
-                "Student loaded successfully!"
-            )
+    if not st.session_state.user:
+        return False
 
-        else:
+    return (
+        normalize_email(st.session_state.user["email"])
+        == ADMIN_EMAIL
+        and ADMIN_EMAIL != ""
+    )
 
-            st.sidebar.error(
-                "Student not found. Please register first."
-            )
+
+def otp_hash(otp):
+
+    return hmac.new(
+        OTP_HASH_SECRET.encode(),
+        otp.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+
+def verify_otp_hash(otp, saved_hash):
+
+    return hmac.compare_digest(
+        otp_hash(otp),
+        str(saved_hash)
+    )
+
+
+# ==================================================
+# EMAIL OTP
+# ==================================================
+
+def send_otp_email(email, otp):
+
+    if not SMTP_EMAIL or not SMTP_APP_PASSWORD:
+        raise ValueError("Gmail configuration is missing in .env.")
+
+    message = EmailMessage()
+    message["Subject"] = "LearnMate AI - Verification OTP"
+    message["From"] = SMTP_EMAIL
+    message["To"] = email
+
+    message.set_content(
+        f"""
+Welcome to LearnMate AI.
+
+Your OTP is {otp}
+
+This OTP expires in 10 minutes.
+
+Do not share this OTP with anyone.
+"""
+    )
+
+    if SMTP_PORT == 465:
+
+        with smtplib.SMTP_SSL(
+            SMTP_HOST,
+            SMTP_PORT,
+            context=ssl.create_default_context(),
+            timeout=20
+        ) as server:
+
+            server.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
+            server.send_message(message)
 
     else:
 
-        st.sidebar.warning(
-            "Please enter your email."
-        )
+        with smtplib.SMTP(
+            SMTP_HOST,
+            SMTP_PORT,
+            timeout=20
+        ) as server:
+
+            server.ehlo()
+            server.starttls(context=ssl.create_default_context())
+            server.ehlo()
+            server.login(SMTP_EMAIL, SMTP_APP_PASSWORD)
+            server.send_message(message)
 
 
-# ==========================================
-# 4. LOAD CURRENT STUDENT
-# ==========================================
+def create_and_send_otp(email):
 
-student = None
+    otp = str(secrets.randbelow(900000) + 100000)
 
-if st.session_state.student_email:
+    expiry = (
+        datetime.now() + timedelta(minutes=10)
+    ).isoformat()
 
-    student = get_student(
-        st.session_state.student_email
+    send_otp_email(email, otp)
+
+    db.save_otp(
+        normalize_email(email),
+        otp_hash(otp),
+        expiry
     )
 
 
-# ==========================================
-# 5. HOME PAGE
-# ==========================================
+def check_otp(email, entered_otp):
 
-if page == "Home":
+    saved = db.get_otp(normalize_email(email))
 
-    st.title("📚 Welcome to LearnMate AI")
+    if not saved:
+        return False, "OTP not found. Request a new OTP."
 
-    st.subheader(
-        "Your Personal Adaptive Exam Tutor"
+    if int(saved.get("attempts", 0)) >= 5:
+        db.delete_otp(email)
+        return False, "Too many attempts. Request a new OTP."
+
+    try:
+        expiry = datetime.fromisoformat(saved["expires_at"])
+
+        if datetime.now() > expiry:
+            db.delete_otp(email)
+            return False, "OTP expired. Request a new OTP."
+
+    except Exception:
+        return False, "Invalid OTP expiry information."
+
+    if not verify_otp_hash(entered_otp.strip(), saved["otp_hash"]):
+        db.increase_otp_attempts(email)
+        return False, "Incorrect OTP."
+
+    return True, "OTP verified successfully."
+
+
+# ==================================================
+# GEMINI AI
+# ==================================================
+
+def generate_gemini_response(prompt):
+
+    if not GEMINI_API_KEY:
+        raise ValueError("Gemini API key is missing in .env.")
+
+    client = genai.Client(api_key=GEMINI_API_KEY)
+
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt
     )
 
-    st.write(
-        """
-        LearnMate AI is an AI-powered personalized
-        learning platform designed to improve students'
-        academic performance.
+    if not response.text:
+        raise ValueError("Gemini returned an empty response.")
 
-        It combines artificial intelligence, diagnostic
-        quizzes, performance tracking and personalized
-        study planning.
-        """
-    )
+    return response.text
 
-    col1, col2 = st.columns(2)
 
-    with col1:
+def show_ai_error(error):
 
-        st.info("📝 Student Registration")
+    message = str(error)
 
-        st.info("🧠 Diagnostic Quiz")
-
-        st.info("📊 Learning Dashboard")
-
-    with col2:
-
-        st.info("🤖 Gemini AI Tutor")
-
-        st.info("📅 AI Study Planner")
-
-    st.divider()
-
-    if student:
-
-        st.success(
-            "Welcome back, " + student["name"] + "!"
-        )
-
-    else:
+    if "429" in message or "RESOURCE_EXHAUSTED" in message:
 
         st.warning(
-            "Register or load your student account to begin."
+            "Gemini API quota is exhausted. "
+            "The offline learning system will be used."
         )
 
+    elif "404" in message or "NOT_FOUND" in message:
 
-# ==========================================
-# 6. STUDENT REGISTRATION
-# ==========================================
+        st.error(
+            "Gemini model was not found. Check GEMINI_MODEL in .env."
+        )
 
-elif page == "Student Registration":
+    elif "API_KEY_INVALID" in message or "API key not valid" in message:
+
+        st.error("Gemini API key is invalid. Check your .env file.")
+
+    else:
+
+        st.error("Gemini error: " + message)
+
+
+def test_gemini():
+
+    try:
+
+        answer = generate_gemini_response(
+            "Reply with exactly: Gemini connection successful."
+        )
+
+        return True, answer
+
+    except Exception as error:
+
+        return False, str(error)
+
+
+# ==================================================
+# OFFLINE STUDY PLAN
+# ==================================================
+
+def offline_plan(subject, level, hours, goal):
+
+    topics = {
+
+        "Python Programming": [
+            "Python basics and variables",
+            "Data types and operators",
+            "Conditional statements",
+            "Loops",
+            "Lists and dictionaries",
+            "Functions and modules",
+            "Practice and revision"
+        ],
+
+        "Java Programming": [
+            "Java fundamentals",
+            "Variables and data types",
+            "Conditions and loops",
+            "Classes and objects",
+            "Inheritance and polymorphism",
+            "Exception handling",
+            "Practice and revision"
+        ],
+
+        "C Programming": [
+            "C fundamentals",
+            "Variables and operators",
+            "Conditional statements",
+            "Loops",
+            "Arrays and strings",
+            "Functions and pointers",
+            "Practice and revision"
+        ],
+
+        "Data Structures and Algorithms": [
+            "Algorithm analysis",
+            "Arrays and strings",
+            "Stacks",
+            "Queues",
+            "Linked lists",
+            "Trees and graphs",
+            "Searching and sorting"
+        ],
+
+        "DBMS": [
+            "DBMS introduction",
+            "ER diagrams",
+            "Relational model",
+            "SQL commands",
+            "Joins and subqueries",
+            "Normalization",
+            "Transactions and revision"
+        ],
+
+        "Operating Systems": [
+            "OS fundamentals",
+            "Process management",
+            "CPU scheduling",
+            "Threads and synchronization",
+            "Deadlocks",
+            "Memory management",
+            "File systems"
+        ],
+
+        "Computer Networks": [
+            "Network fundamentals",
+            "OSI model",
+            "TCP/IP model",
+            "Data link layer",
+            "IP addressing",
+            "Transport layer",
+            "Application layer"
+        ],
+
+        "Artificial Intelligence": [
+            "AI introduction",
+            "Intelligent agents",
+            "Search algorithms",
+            "Knowledge representation",
+            "Machine learning basics",
+            "AI applications",
+            "Revision"
+        ],
+
+        "Machine Learning": [
+            "ML introduction",
+            "Supervised learning",
+            "Unsupervised learning",
+            "Regression",
+            "Classification",
+            "Model evaluation",
+            "Revision"
+        ],
+
+        "Web Development": [
+            "HTML",
+            "CSS",
+            "JavaScript",
+            "DOM",
+            "Responsive design",
+            "Forms and validation",
+            "Mini project"
+        ]
+    }
+
+    selected_topics = topics.get(
+        subject,
+        [
+            f"Introduction to {subject}",
+            f"Basic concepts of {subject}",
+            f"Important definitions of {subject}",
+            f"Core topics in {subject}",
+            f"Examples and applications of {subject}",
+            f"Practice questions in {subject}",
+            f"Revision of {subject}"
+        ]
+    )
+
+    plan = f"""
+# 7-Day Study Plan
+
+Subject: {subject}
+
+Level: {level}
+
+Daily hours: {hours}
+
+Goal: {goal}
+
+"""
+
+    for day in range(7):
+
+        plan += f"""
+## Day {day + 1}
+
+Topic: {selected_topics[day]}
+
+Study activities:
+
+1. Read and understand the topic.
+2. Prepare short notes.
+3. Practise examples.
+4. Solve questions.
+5. Revise the topic.
+
+Daily study time: {hours} hours.
+
+"""
+
+    return plan
+
+
+def generate_plan(subject, level, hours, goal):
+
+    prompt = f"""
+You are an expert college teacher.
+
+Create a detailed 7-day study plan.
+
+Subject: {subject}
+Level: {level}
+Daily hours: {hours}
+Goal: {goal}
+
+For every day include:
+1. Topic
+2. Explanation
+3. Practical activity
+4. Practice questions
+5. Revision task
+
+Use simple language suitable for a BTech student.
+"""
+
+    try:
+
+        return generate_gemini_response(prompt), "Gemini AI"
+
+    except Exception as error:
+
+        show_ai_error(error)
+
+        return offline_plan(subject, level, hours, goal), "Offline Study Planner"
+
+
+# ==================================================
+# OFFLINE TUTOR
+# ==================================================
+
+def offline_tutor(subject, question):
+
+    q = question.lower()
+
+    topics = {
+
+        "Python Programming": {
+            "variable": "A variable stores a value. Example: age = 20.",
+            "loop": "Loops repeat statements. Python supports for and while loops.",
+            "list": "A list stores multiple values. Example: numbers = [10, 20, 30].",
+            "function": "A function is a reusable block of code defined using def.",
+            "dictionary": "A dictionary stores key-value pairs.",
+            "inheritance": "Inheritance allows one class to reuse another class's properties and methods.",
+            "if": "An if statement executes code when a condition is true.",
+            "data type": "Common Python types include int, float, str, bool, list, tuple and dict."
+        },
+
+        "Java Programming": {
+            "class": "A class is a blueprint for creating objects.",
+            "object": "An object is an instance of a class.",
+            "inheritance": "Inheritance allows a Java class to inherit another class using extends.",
+            "polymorphism": "Polymorphism means one interface or method name can have different forms.",
+            "constructor": "A constructor initializes an object and has the same name as its class."
+        },
+
+        "C Programming": {
+            "pointer": "A pointer stores the memory address of another variable.",
+            "array": "An array stores multiple values of the same data type.",
+            "loop": "C supports for, while and do-while loops.",
+            "function": "A function is a reusable block of code.",
+            "structure": "A structure groups different data types under one name."
+        },
+
+        "Data Structures and Algorithms": {
+            "stack": "A stack follows LIFO: Last In, First Out. Operations include push, pop and peek.",
+            "queue": "A queue follows FIFO: First In, First Out. Operations include enqueue and dequeue.",
+            "linked list": "A linked list contains nodes connected using links.",
+            "binary search": "Binary search searches sorted data by repeatedly dividing the search interval in half. Its time complexity is O(log n).",
+            "sorting": "Sorting arranges elements. Examples include bubble sort, selection sort, insertion sort, merge sort and quick sort."
+        },
+
+        "DBMS": {
+            "primary key": "A primary key uniquely identifies each record in a table.",
+            "foreign key": "A foreign key refers to a key in another table and establishes a relationship.",
+            "normalization": "Normalization organizes tables to reduce redundancy.",
+            "sql": "SQL means Structured Query Language. SELECT retrieves records, INSERT adds records, UPDATE modifies records and DELETE removes records."
+        },
+
+        "Operating Systems": {
+            "process": "A process is a program in execution.",
+            "deadlock": "Deadlock occurs when processes wait indefinitely for resources held by one another.",
+            "scheduling": "CPU scheduling selects which process gets the CPU. Algorithms include FCFS, SJF and Round Robin.",
+            "memory": "Memory management allocates and manages main memory for processes."
+        },
+
+        "Computer Networks": {
+            "osi": "The OSI model has seven layers: Physical, Data Link, Network, Transport, Session, Presentation and Application.",
+            "tcp": "TCP is a reliable, connection-oriented transport protocol.",
+            "ip address": "An IP address identifies a device on an IP network."
+        },
+
+        "Artificial Intelligence": {
+            "agent": "An intelligent agent observes its environment and takes actions to achieve goals.",
+            "machine learning": "Machine learning enables systems to learn patterns from data.",
+            "search": "Search algorithms explore possible states to find a solution."
+        },
+
+        "Mathematics": {
+            "matrix": "A matrix is a rectangular arrangement of values in rows and columns.",
+            "derivative": "A derivative measures the rate of change of a function.",
+            "integration": "Integration is used to find accumulated quantities and areas under curves."
+        },
+
+        "Physics": {
+            "newton": "Newton's laws describe the relationship between force and motion.",
+            "force": "Force is an interaction that can change an object's motion. F = ma.",
+            "energy": "Energy is the capacity to do work."
+        },
+
+        "Chemistry": {
+            "atom": "An atom is the basic unit of a chemical element.",
+            "molecule": "A molecule consists of two or more atoms chemically bonded together.",
+            "bond": "A chemical bond holds atoms together."
+        }
+    }
+
+    selected = topics.get(subject, {})
+
+    matches = []
+
+    for keyword, answer in selected.items():
+
+        if keyword in q:
+            matches.append(answer)
+
+    if matches:
+        return "\n\n".join(matches)
+
+    return (
+        f"Your question is not covered by the offline {subject} topic library. "
+        "Try asking about a basic definition, concept or example. "
+        "Gemini AI is required for broader generated answers."
+    )
+
+
+def tutor_answer(subject, question, difficulty):
+
+    prompt = f"""
+You are LearnMate AI, a college subject tutor.
+
+Subject: {subject}
+Difficulty: {difficulty}
+Question: {question}
+
+Explain in simple language.
+
+Include:
+1. Definition
+2. Explanation
+3. Example
+4. Important points
+5. One practice question
+"""
+
+    try:
+
+        return generate_gemini_response(prompt), "Gemini AI"
+
+    except Exception as error:
+
+        show_ai_error(error)
+
+        return offline_tutor(subject, question), "Offline Tutor"
+
+
+# ==================================================
+# QUIZ
+# ==================================================
+
+QUIZ_BANK = {
+
+    "Python Programming": [
+        ("Which keyword defines a function?", ["function", "def", "fun", "define"], "def", "Python uses def to define functions."),
+        ("Which type stores True or False?", ["int", "str", "bool", "list"], "bool", "bool represents True or False."),
+        ("Which symbol starts a Python comment?", ["//", "#", "/*", "--"], "#", "Python uses # for comments."),
+        ("Which collection is mutable?", ["tuple", "string", "list", "int"], "list", "Lists can be modified."),
+        ("What does len() return?", ["Length", "Type", "Address", "Value"], "Length", "len() returns the number of items.")
+    ],
+
+    "Java Programming": [
+        ("Which keyword creates an object?", ["class", "new", "this", "static"], "new", "new creates objects."),
+        ("What is Java's entry point?", ["start()", "run()", "main()", "init()"], "main()", "Java execution begins in main()."),
+        ("Which keyword supports class inheritance?", ["extends", "implements", "import", "package"], "extends", "extends is used for class inheritance."),
+        ("Which type stores true or false?", ["int", "boolean", "char", "float"], "boolean", "boolean stores true or false."),
+        ("Which symbol ends a Java statement?", [".", ":", ";", ","], ";", "Java statements generally end with semicolons.")
+    ],
+
+    "C Programming": [
+        ("Which function displays output?", ["scanf", "printf", "main", "read"], "printf", "printf displays formatted output."),
+        ("Which header contains printf?", ["stdlib.h", "string.h", "stdio.h", "math.h"], "stdio.h", "printf is declared in stdio.h."),
+        ("Array indexing starts from?", ["1", "0", "-1", "2"], "0", "C array indexing starts from zero."),
+        ("Which operator gives an address?", ["*", "&", "%", "#"], "&", "& is the address-of operator."),
+        ("Which loop executes at least once?", ["for", "while", "do-while", "none"], "do-while", "do-while checks its condition after execution.")
+    ],
+
+    "Data Structures and Algorithms": [
+        ("Which principle does a stack follow?", ["FIFO", "LIFO", "Random", "None"], "LIFO", "A stack follows Last In, First Out."),
+        ("Which principle does a queue follow?", ["LIFO", "FIFO", "Random", "None"], "FIFO", "A queue follows First In, First Out."),
+        ("Which structure uses connected nodes?", ["Array", "Linked list", "Integer", "String"], "Linked list", "A linked list consists of connected nodes."),
+        ("Binary search requires?", ["Unsorted data", "Sorted data", "No data", "Duplicate data"], "Sorted data", "Binary search requires sorted data."),
+        ("Merge sort time complexity?", ["O(n)", "O(n log n)", "O(n²)", "O(1)"], "O(n log n)", "Merge sort takes O(n log n) time.")
+    ],
+
+    "DBMS": [
+        ("What does DBMS stand for?", ["Database Management System", "Data Backup System", "Digital Base System", "Database Memory System"], "Database Management System", "DBMS means Database Management System."),
+        ("Which key uniquely identifies a row?", ["Foreign key", "Primary key", "Duplicate key", "None"], "Primary key", "A primary key uniquely identifies a row."),
+        ("Which SQL command retrieves data?", ["INSERT", "DELETE", "SELECT", "UPDATE"], "SELECT", "SELECT retrieves data."),
+        ("Which command modifies existing records?", ["UPDATE", "CREATE", "DROP", "SELECT"], "UPDATE", "UPDATE modifies existing rows."),
+        ("Why is normalization used?", ["Increase duplication", "Reduce redundancy", "Delete tables", "Create passwords"], "Reduce redundancy", "Normalization reduces redundancy.")
+    ]
+}
+
+
+def make_quiz(subject, difficulty):
+
+    prompt = f"""
+Create five multiple-choice questions for a BTech student.
+
+Subject: {subject}
+Difficulty: {difficulty}
+
+Return only valid JSON:
+
+[
+ {{
+ "question": "Question",
+ "options": ["A", "B", "C", "D"],
+ "answer": "Correct option",
+ "explanation": "Explanation"
+ }}
+]
+"""
+
+    try:
+
+        response = generate_gemini_response(prompt)
+
+        cleaned = re.sub(
+            r"```(?:json)?|```",
+            "",
+            response
+        ).strip()
+
+        questions = json.loads(cleaned)
+
+        if not isinstance(questions, list) or not questions:
+            raise ValueError("Invalid quiz response.")
+
+        for question in questions:
+
+            if not all(
+                key in question
+                for key in ["question", "options", "answer"]
+            ):
+                raise ValueError("Incomplete quiz question.")
+
+            if len(question["options"]) < 2:
+                raise ValueError("Invalid quiz options.")
+
+        return questions[:5], "Gemini AI"
+
+    except Exception as error:
+
+        show_ai_error(error)
+
+        questions = QUIZ_BANK.get(subject)
+
+        if questions is None:
+
+            questions = [
+                (
+                    f"What helps you learn {subject}?",
+                    [
+                        "Regular practice",
+                        "Avoiding revision",
+                        "Skipping examples",
+                        "Ignoring concepts"
+                    ],
+                    "Regular practice",
+                    "Regular practice improves understanding."
+                ),
+                (
+                    "What should you do after studying a topic?",
+                    [
+                        "Revise and practise",
+                        "Forget it",
+                        "Skip exercises",
+                        "Avoid questions"
+                    ],
+                    "Revise and practise",
+                    "Revision improves retention."
+                )
+            ] * 2 + [
+                (
+                    f"What is important in {subject}?",
+                    [
+                        "Understanding concepts",
+                        "Avoiding concepts",
+                        "Skipping practice",
+                        "Ignoring examples"
+                    ],
+                    "Understanding concepts",
+                    "Conceptual understanding is important."
+                )
+            ]
+
+        result = []
+
+        for question, options, answer, explanation in questions:
+
+            result.append({
+                "question": question,
+                "options": options,
+                "answer": answer,
+                "explanation": explanation
+            })
+
+        return result, "Offline Quiz"
+
+
+# ==================================================
+# REGISTRATION
+# ==================================================
+
+def registration_page():
 
     st.title("📝 Student Registration")
 
-    st.write(
-        "Enter your details to create your LearnMate account."
+    name = st.text_input("Full Name", key="reg_name")
+    email = st.text_input("Gmail Address", key="reg_email")
+    password = st.text_input(
+        "Create Password",
+        type="password",
+        key="reg_password"
     )
 
-    with st.form("registration_form"):
+    if st.button("Send Email OTP"):
 
-        name = st.text_input("Full Name")
+        email = normalize_email(email)
 
-        email = st.text_input("Email Address")
+        if not name.strip() or not email or not password:
+            st.error("Fill in all fields.")
 
-        course = st.text_input(
-            "Course",
-            value="B.Tech CSE"
+        elif not re.fullmatch(r"[^@\s]+@gmail\.com", email):
+            st.error("Enter a valid Gmail address.")
+
+        elif len(password) < 8:
+            st.error("Password must have at least 8 characters.")
+
+        elif db.user_exists(email):
+            st.error("This email is already registered.")
+
+        else:
+
+            try:
+
+                create_and_send_otp(email)
+
+                st.session_state.register_email = email
+                st.session_state.register_otp_sent = True
+
+                st.success("OTP sent to your Gmail.")
+
+            except Exception as error:
+
+                st.error("Gmail sending failed: " + str(error))
+
+    if st.session_state.register_otp_sent:
+
+        st.divider()
+        st.subheader("Verify Email")
+
+        entered_otp = st.text_input(
+            "Enter 6-digit OTP",
+            max_chars=6
         )
 
-        subject = st.selectbox(
-            "Select Your Subject",
-            [
-                "Python",
-                "Java",
-                "C Programming",
-                "Data Structures",
-                "Database Management Systems",
-                "Computer Networks",
-                "Operating Systems"
-            ]
-        )
+        if st.button("Verify OTP and Register"):
 
-        level = st.selectbox(
-            "Academic Level",
-            [
-                "Beginner",
-                "Intermediate",
-                "Advanced"
-            ]
-        )
+            email = st.session_state.register_email
 
-        study_hours = st.number_input(
-            "Daily Study Hours",
-            min_value=1,
-            max_value=12,
-            value=3
-        )
+            success, message = check_otp(email, entered_otp)
 
-        submitted = st.form_submit_button(
-            "Register Student"
-        )
+            if not success:
 
-        if submitted:
+                st.error(message)
 
-            if not name.strip() or not email.strip():
+            elif db.user_exists(email):
 
-                st.error(
-                    "Please enter your name and email."
-                )
-
-            elif "@" not in email or "." not in email:
-
-                st.error(
-                    "Please enter a valid email address."
-                )
+                st.error("This email is already registered.")
 
             else:
 
-                try:
-
-                    save_student(
-                        name.strip(),
-                        email.strip(),
-                        subject,
-                        level,
-                        study_hours
-                    )
-
-                    # Update course separately if supported
-                    from database import get_connection
-
-                    conn = get_connection()
-
-                    cursor = conn.cursor()
-
-                    cursor.execute(
-                        "UPDATE students SET course = ? WHERE email = ?",
-                        (course, email.strip())
-                    )
-
-                    conn.commit()
-                    conn.close()
-
-                    st.session_state.student_email = email.strip()
-
-                    st.session_state.generated_study_plan = ""
-
-                    st.success(
-                        "Registration successful!"
-                    )
-
-                    st.rerun()
-
-                except Exception as error:
-
-                    st.error(
-                        "Registration failed."
-                    )
-
-                    st.code(str(error))
-
-
-# ==========================================
-# 7. DIAGNOSTIC QUIZ
-# ==========================================
-
-elif page == "Diagnostic Quiz":
-
-    st.title("🧠 Diagnostic Quiz")
-
-    if student is None:
-
-        st.warning(
-            "Please register or load your student account first."
-        )
-
-    else:
-
-        st.write(
-            "Student: " + student["name"]
-        )
-
-        quiz_subject = st.selectbox(
-            "Choose Quiz Subject",
-            [
-                "Python",
-                "Java",
-                "C Programming",
-                "Data Structures"
-            ]
-        )
-
-        questions = [
-
-            {
-                "question": "Which keyword defines a function in Python?",
-                "options": ["function", "def", "fun", "define"],
-                "answer": "def"
-            },
-
-            {
-                "question": "Which data type stores True or False?",
-                "options": ["int", "str", "bool", "float"],
-                "answer": "bool"
-            },
-
-            {
-                "question": "Which symbol is used for comments in Python?",
-                "options": ["//", "#", "/*", "--"],
-                "answer": "#"
-            },
-
-            {
-                "question": "Which method adds an item to a Python list?",
-                "options": ["add()", "insertEnd()", "append()", "push()"],
-                "answer": "append()"
-            },
-
-            {
-                "question": "Which loop iterates over a sequence?",
-                "options": ["for", "switch", "case", "goto"],
-                "answer": "for"
-            }
-
-        ]
-
-        with st.form("quiz_form"):
-
-            answers = []
-
-            for index, question in enumerate(questions):
-
-                st.write(
-                    "**Q" + str(index + 1) + ". " +
-                    question["question"] + "**"
+                created = db.create_user(
+                    st.session_state.reg_name.strip(),
+                    email,
+                    st.session_state.reg_password
                 )
 
-                answer = st.radio(
-                    "Select your answer",
-                    question["options"],
-                    key="question_" + str(index)
-                )
+                if created:
 
-                answers.append(answer)
+                    db.delete_otp(email)
 
-            quiz_submitted = st.form_submit_button(
-                "Submit Quiz"
+                    db.log_activity(
+                        email,
+                        "Registration",
+                        "Email verified and account created."
+                    )
+
+                    st.session_state.register_otp_sent = False
+                    st.session_state.register_email = ""
+
+                    st.success("Registration successful. Please log in.")
+
+                else:
+
+                    st.error("Registration failed.")
+
+
+# ==================================================
+# LOGIN AND FORGOT PASSWORD
+# ==================================================
+
+def login_page():
+
+    st.title("🔐 Student Login")
+
+    email = st.text_input("Email Address", key="login_email")
+
+    password = st.text_input(
+        "Password",
+        type="password",
+        key="login_password"
+    )
+
+    if st.button("Login", use_container_width=True):
+
+        email = normalize_email(email)
+
+        login_result = db.login_user(email, password)
+
+        if login_result:
+
+            # login_user returns a dictionary in this database.py.
+            # This also supports an older Boolean return.
+            if isinstance(login_result, dict):
+
+                user = login_result
+
+            else:
+
+                user = None
+
+                for student in db.get_all_users():
+
+                    if normalize_email(student["email"]) == email:
+                        user = student
+                        break
+
+                if user is None:
+                    st.error("Student account details could not be loaded.")
+                    return
+
+            st.session_state.logged_in = True
+            st.session_state.user = user
+
+            db.log_activity(
+                email,
+                "Login",
+                "Student logged in."
             )
 
-            if quiz_submitted:
+            st.success("Login successful.")
+            st.rerun()
+
+        else:
+
+            st.error("Invalid email or password.")
+
+    st.divider()
+    st.subheader("Forgot Password")
+
+    forgot_email = st.text_input(
+        "Registered Gmail",
+        key="forgot_email"
+    )
+
+    if st.button("Send Password Reset OTP"):
+
+        forgot_email = normalize_email(forgot_email)
+
+        if not db.user_exists(forgot_email):
+
+            st.error("Email is not registered.")
+
+        else:
+
+            try:
+
+                create_and_send_otp(forgot_email)
+
+                st.session_state.forgot_email = forgot_email
+                st.session_state.forgot_otp_sent = True
+
+                st.success("Password reset OTP sent.")
+
+            except Exception as error:
+
+                st.error("Email sending failed: " + str(error))
+
+    if st.session_state.forgot_otp_sent:
+
+        reset_otp = st.text_input(
+            "Enter reset OTP",
+            key="reset_otp"
+        )
+
+        new_password = st.text_input(
+            "New Password",
+            type="password",
+            key="reset_password"
+        )
+
+        if st.button("Verify OTP and Reset Password"):
+
+            email = st.session_state.forgot_email
+
+            success, message = check_otp(email, reset_otp)
+
+            if not success:
+
+                st.error(message)
+
+            elif len(new_password) < 8:
+
+                st.error("Password must have at least 8 characters.")
+
+            else:
+
+                changed = db.update_password(
+                    email,
+                    new_password
+                )
+
+                if changed:
+
+                    db.delete_otp(email)
+
+                    db.log_activity(
+                        email,
+                        "Password Reset",
+                        "Password changed through OTP."
+                    )
+
+                    st.session_state.forgot_otp_sent = False
+
+                    st.success("Password reset successfully.")
+
+                else:
+
+                    st.error("Password update failed.")
+
+
+# ==================================================
+# DASHBOARD
+# ==================================================
+
+def dashboard_page():
+
+    user = st.session_state.user
+
+    st.title("🎓 LearnMate AI")
+
+    st.subheader("Your Personal AI Learning Assistant")
+
+    st.write("Welcome, **" + user["name"] + "**")
+
+    col1, col2, col3 = st.columns(3)
+
+    col1.metric("Available Subjects", len(SUBJECTS))
+    col2.metric("Study Plan", "7 Days")
+    col3.metric("Learning Tools", "3")
+
+    st.divider()
+
+    st.markdown("""
+    ### Features
+
+    - 📚 7-Day AI Study Plan
+    - 🤖 Multi-subject AI Tutor
+    - 📝 Diagnostic Quiz
+    - 📊 Student Activity Tracking
+    - 🔐 Password Management
+    """)
+
+
+# ==================================================
+# STUDY PLAN PAGE
+# ==================================================
+
+def study_plan_page():
+
+    st.title("📚 7-Day AI Study Plan")
+
+    subject = st.selectbox("Select Subject", SUBJECTS)
+
+    level = st.selectbox(
+        "Your Level",
+        ["Beginner", "Intermediate", "Advanced"]
+    )
+
+    hours = st.slider(
+        "Daily Study Hours",
+        1,
+        10,
+        2
+    )
+
+    goal = st.text_area(
+        "Your Learning Goal",
+        placeholder="Example: Prepare for semester examination."
+    )
+
+    if st.button("Generate 7-Day Study Plan"):
+
+        with st.spinner("Generating your study plan..."):
+
+            plan, source = generate_plan(
+                subject,
+                level,
+                hours,
+                goal
+            )
+
+        st.success("Generated using " + source)
+
+        st.markdown(plan)
+
+        db.save_study_plan(
+            st.session_state.user["email"],
+            subject,
+            level,
+            hours,
+            plan
+        )
+
+        record_activity(
+            "Study Plan Generated",
+            f"{subject} - {source}"
+        )
+
+        st.download_button(
+            "Download Study Plan",
+            plan,
+            "LearnMate_Study_Plan.txt",
+            mime="text/plain"
+        )
+
+
+# ==================================================
+# AI TUTOR PAGE
+# ==================================================
+
+def tutor_page():
+
+    st.title("🤖 AI Tutor")
+
+    subject = st.selectbox(
+        "Select Subject",
+        SUBJECTS,
+        key="tutor_subject"
+    )
+
+    difficulty = st.selectbox(
+        "Difficulty",
+        ["Beginner", "Intermediate", "Advanced"]
+    )
+
+    question = st.text_area(
+        "Ask your question",
+        placeholder="Example: Explain Python inheritance with an example."
+    )
+
+    if st.button("Ask AI Tutor"):
+
+        if not question.strip():
+
+            st.warning("Enter your question.")
+
+        else:
+
+            with st.spinner("Preparing answer..."):
+
+                answer, source = tutor_answer(
+                    subject,
+                    question,
+                    difficulty
+                )
+
+            st.success("Answer source: " + source)
+
+            st.markdown(answer)
+
+            db.save_tutor_interaction(
+                st.session_state.user["email"],
+                question,
+                answer
+            )
+
+            record_activity(
+                "AI Tutor Used",
+                subject + " - " + source
+            )
+
+
+# ==================================================
+# DIAGNOSTIC QUIZ PAGE
+# ==================================================
+
+def quiz_page():
+
+    st.title("📝 Diagnostic Quiz")
+
+    subject = st.selectbox(
+        "Select Subject",
+        SUBJECTS,
+        key="quiz_subject"
+    )
+
+    difficulty = st.selectbox(
+        "Difficulty",
+        ["Beginner", "Intermediate", "Advanced"]
+    )
+
+    if st.button("Generate Quiz"):
+
+        with st.spinner("Preparing questions..."):
+
+            questions, source = make_quiz(
+                subject,
+                difficulty
+            )
+
+        st.session_state.quiz_questions = questions
+        st.session_state.quiz_subject_name = subject
+        st.session_state.quiz_source = source
+        st.session_state.quiz_submitted = False
+
+        st.rerun()
+
+    if "quiz_questions" in st.session_state:
+
+        questions = st.session_state.quiz_questions
+
+        st.info("Quiz source: " + st.session_state.quiz_source)
+
+        if not st.session_state.quiz_submitted:
+
+            with st.form("quiz_form"):
+
+                answers = []
+
+                for index, question in enumerate(questions):
+
+                    st.markdown(
+                        f"**Question {index + 1}: {question['question']}**"
+                    )
+
+                    answer = st.radio(
+                        "Choose answer",
+                        question["options"],
+                        key=f"quiz_{index}"
+                    )
+
+                    answers.append(answer)
+
+                    st.divider()
+
+                submitted = st.form_submit_button("Submit Quiz")
+
+            if submitted:
 
                 score = 0
 
                 for index, question in enumerate(questions):
 
-                    if answers[index] == question["answer"]:
-
+                    if (
+                        answers[index].strip().lower()
+                        == question["answer"].strip().lower()
+                    ):
                         score += 1
 
-                save_quiz_result(
-                    student["email"],
-                    quiz_subject,
+                st.session_state.quiz_score = score
+                st.session_state.quiz_answers = answers
+                st.session_state.quiz_submitted = True
+
+                db.save_quiz_result(
+                    st.session_state.user["email"],
+                    st.session_state.quiz_subject_name,
                     score,
                     len(questions)
                 )
 
-                st.session_state.last_quiz_score = score
-
-                st.success(
-                    "Quiz submitted successfully!"
+                record_activity(
+                    "Quiz Completed",
+                    f"{st.session_state.quiz_subject_name}: {score}/{len(questions)}"
                 )
 
-                st.metric(
-                    "Your Score",
-                    str(score) + "/" + str(len(questions))
+                st.rerun()
+
+        else:
+
+            score = st.session_state.quiz_score
+
+            st.subheader("Your Quiz Result")
+
+            st.metric(
+                "Score",
+                f"{score}/{len(questions)}"
+            )
+
+            st.progress(score / len(questions))
+
+            for index, question in enumerate(questions):
+
+                st.markdown(
+                    f"**Question {index + 1}: {question['question']}**"
                 )
-
-                percentage = (
-                    score / len(questions)
-                ) * 100
-
-                st.progress(int(percentage))
 
                 st.write(
-                    "Your Performance: " +
-                    str(round(percentage, 2)) + "%"
+                    "Your answer: "
+                    + st.session_state.quiz_answers[index]
                 )
 
+                st.write(
+                    "Correct answer: "
+                    + question["answer"]
+                )
 
-# ==========================================
-# 8. LEARNING DASHBOARD
-# ==========================================
+                st.caption(
+                    question.get("explanation", "")
+                )
 
-elif page == "Learning Dashboard":
+                st.divider()
 
-    st.title("📊 Learning Dashboard")
+            if st.button("Take Another Quiz"):
 
-    if student is None:
+                del st.session_state.quiz_questions
+                st.session_state.quiz_submitted = False
 
-        st.warning(
-            "Please register or load your student account."
-        )
+                st.rerun()
 
-    else:
 
-        st.subheader(
-            "Welcome, " + student["name"]
-        )
+# ==================================================
+# MY ACTIVITY
+# ==================================================
 
-        results = get_quiz_results(
-            student["email"]
-        )
+def my_activity_page():
 
-        if results:
+    st.title("📊 My Activity")
 
-            total_score = 0
+    email = st.session_state.user["email"]
 
-            total_questions = 0
+    tables = {
+        "Activity Logs": "activity_logs",
+        "Study Plans": "study_plans",
+        "Quiz Results": "quiz_results",
+        "Tutor Interactions": "tutor_interactions"
+    }
 
-            for result in results:
+    for title, table in tables.items():
 
-                total_score += result["score"]
+        st.subheader(title)
 
-                total_questions += result["total_questions"]
+        records = db.get_user_records(table, email)
 
-            if total_questions > 0:
+        if records:
 
-                percentage = (
-                    total_score / total_questions
-                ) * 100
+            st.dataframe(
+                pd.DataFrame(records),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+
+            st.info("No records available.")
+
+
+# ==================================================
+# CHANGE PASSWORD
+# ==================================================
+
+def change_password_page():
+
+    st.title("🔑 Change Password")
+
+    old_password = st.text_input(
+        "Current Password",
+        type="password"
+    )
+
+    new_password = st.text_input(
+        "New Password",
+        type="password"
+    )
+
+    confirm_password = st.text_input(
+        "Confirm New Password",
+        type="password"
+    )
+
+    if st.button("Update Password"):
+
+        email = st.session_state.user["email"]
+
+        valid_user = db.login_user(email, old_password)
+
+        if not valid_user:
+
+            st.error("Current password is incorrect.")
+
+        elif len(new_password) < 8:
+
+            st.error("New password must have at least 8 characters.")
+
+        elif new_password != confirm_password:
+
+            st.error("Passwords do not match.")
+
+        else:
+
+            if db.update_password(email, new_password):
+
+                record_activity(
+                    "Password Changed",
+                    "Student changed password."
+                )
+
+                st.success("Password changed successfully.")
 
             else:
 
-                percentage = 0
-
-            col1, col2, col3 = st.columns(3)
-
-            col1.metric(
-                "Total Quizzes",
-                len(results)
-            )
-
-            col2.metric(
-                "Total Score",
-                str(total_score) + "/" + str(total_questions)
-            )
-
-            col3.metric(
-                "Average Performance",
-                str(round(percentage, 2)) + "%"
-            )
-
-            st.subheader("Quiz History")
-
-            for result in results:
-
-                st.write(
-                    result["subject"] + " : " +
-                    str(result["score"]) + "/" +
-                    str(result["total_questions"])
-                )
-
-        else:
-
-            st.info(
-                "Complete a diagnostic quiz to see your performance."
-            )
-
-        st.divider()
-
-        st.subheader("Student Details")
-
-        st.write("Course:", student["course"])
-
-        st.write("Subject:", student["subject"])
-
-        st.write("Level:", student["level"])
-
-        st.write(
-            "Daily Study Hours:",
-            student["study_hours"]
-        )
+                st.error("Password update failed.")
 
 
-# ==========================================
-# 9. AI TUTOR
-# ==========================================
+# ==================================================
+# ADMIN PAGES
+# ==================================================
 
-elif page == "AI Tutor":
+def registered_students_page():
 
-    st.title("🤖 Gemini AI Tutor")
+    st.title("👥 Registered Students")
 
-    st.write(
-        "Ask questions and receive AI-powered explanations."
-    )
+    users = db.get_all_users()
 
-    if student is None:
+    if users:
 
-        st.warning(
-            "Please register or load your student account first."
+        st.metric("Total Students", len(users))
+
+        st.dataframe(
+            pd.DataFrame(users),
+            use_container_width=True,
+            hide_index=True
         )
 
     else:
 
-        tutor_subject = st.selectbox(
-            "Select Subject",
-            [
-                "Python",
-                "Java",
-                "C Programming",
-                "Data Structures",
-                "Database Management Systems"
-            ]
-        )
-
-        answer_type = st.selectbox(
-            "Choose Answer Style",
-            [
-                "Simple Explanation",
-                "Step-by-Step Explanation",
-                "Exam Answer",
-                "With Examples"
-            ]
-        )
-
-        question = st.text_area(
-            "Enter Your Question"
-        )
-
-        if st.button("Ask Gemini"):
-
-            if not question.strip():
-
-                st.warning(
-                    "Please enter your question."
-                )
-
-            else:
-
-                try:
-
-                    with st.spinner(
-                        "Gemini is preparing your answer..."
-                    ):
-
-                        answer = get_tutor_response(
-                            question,
-                            tutor_subject,
-                            student["level"],
-                            answer_type
-                        )
-
-                    st.subheader("AI Tutor Answer")
-
-                    st.markdown(answer)
-
-                    save_tutor_question(
-                        student["email"],
-                        tutor_subject,
-                        question,
-                        answer
-                    )
-
-                except Exception as error:
-
-                    st.error(
-                        "Gemini could not generate an answer."
-                    )
-
-                    st.code(str(error))
-
-        st.divider()
-
-        st.subheader("Previous Questions")
-
-        previous_questions = get_tutor_questions(
-            student["email"]
-        )
-
-        if previous_questions:
-
-            for item in previous_questions:
-
-                with st.expander(item["question"]):
-
-                    st.markdown(item["answer"])
-
-        else:
-
-            st.info(
-                "No previous questions available."
-            )
+        st.info("No registered students.")
 
 
-# ==========================================
-# 10. AI STUDY PLANNER
-# ==========================================
+def student_learning_records_page():
 
-elif page == "AI Study Planner":
+    st.title("📚 Student Learning Records")
 
-    st.title("📅 AI Study Planner")
+    users = db.get_all_users()
 
-    st.write(
-        "Generate your personalized seven-day study schedule."
+    if not users:
+
+        st.info("No students found.")
+        return
+
+    selected_email = st.selectbox(
+        "Select Student",
+        [user["email"] for user in users]
     )
 
-    if student is None:
+    for title, table in [
+        ("Study Plans", "study_plans"),
+        ("Quiz Results", "quiz_results"),
+        ("Tutor Interactions", "tutor_interactions"),
+        ("Activity Logs", "activity_logs")
+    ]:
 
-        st.warning(
-            "Please register or load your student account first."
+        st.subheader(title)
+
+        records = db.get_user_records(
+            table,
+            selected_email
         )
 
-    else:
+        if records:
 
-        st.subheader("Student Information")
-
-        col1, col2 = st.columns(2)
-
-        with col1:
-
-            st.write(
-                "**Name:**",
-                student["name"]
-            )
-
-            st.write(
-                "**Subject:**",
-                student["subject"]
-            )
-
-            st.write(
-                "**Academic Level:**",
-                student["level"]
-            )
-
-        with col2:
-
-            st.write(
-                "**Daily Study Hours:**",
-                student["study_hours"]
-            )
-
-            st.write(
-                "**Email:**",
-                student["email"]
-            )
-
-        quiz_results = get_quiz_results(
-            student["email"]
-        )
-
-        st.divider()
-
-        st.subheader("Your Quiz Performance")
-
-        if quiz_results:
-
-            for result in quiz_results:
-
-                st.write(
-                    result["subject"] + " : " +
-                    str(result["score"]) + "/" +
-                    str(result["total_questions"])
-                )
-
-        else:
-
-            st.info(
-                "No quiz results found. "
-                "You can still generate a study plan."
-            )
-
-        st.divider()
-
-        if st.button(
-            "✨ Generate My Study Plan",
-            use_container_width=True
-        ):
-
-            try:
-
-                with st.spinner(
-                    "Gemini is generating your personalized plan. Please wait..."
-                ):
-
-                    plan = generate_study_plan(
-                        student,
-                        quiz_results
-                    )
-
-                st.session_state.generated_study_plan = plan
-
-                st.success(
-                    "Your study plan was generated successfully!"
-                )
-
-            except Exception as error:
-
-                st.error(
-                    "Study plan generation failed."
-                )
-
-                if (
-                    "504" in str(error)
-                    or "DEADLINE_EXCEEDED" in str(error)
-                ):
-
-                    st.warning(
-                        "Gemini took too long to respond. "
-                        "Please wait and try again."
-                    )
-
-                else:
-
-                    st.code(str(error))
-
-        if st.session_state.generated_study_plan:
-
-            st.divider()
-
-            st.subheader(
-                "📚 Your Personalized 7-Day Study Plan"
-            )
-
-            st.markdown(
-                st.session_state.generated_study_plan
-            )
-
-            st.download_button(
-                "Download Study Plan",
-                data=st.session_state.generated_study_plan,
-                file_name="LearnMate_Study_Plan.txt",
-                mime="text/plain"
+            st.dataframe(
+                pd.DataFrame(records),
+                use_container_width=True,
+                hide_index=True
             )
 
         else:
 
-            try:
-
-                previous_plan = get_latest_study_plan(
-                    student["email"]
-                )
-
-                if previous_plan:
-
-                    st.subheader(
-                        "Previously Saved Study Plan"
-                    )
-
-                    st.markdown(
-                        previous_plan["plan"]
-                    )
-
-            except Exception as error:
-
-                st.warning(
-                    "Could not load the previously saved plan."
-                )
-
-                st.code(str(error))
+            st.info("No records available.")
 
 
-# ==========================================
-# 11. FOOTER
-# ==========================================
+def all_student_activities_page():
 
-st.sidebar.divider()
+    st.title("📈 All Student Activities")
 
-st.sidebar.caption(
-    "LearnMate AI"
-)
+    for title, table in [
+        ("Activity Logs", "activity_logs"),
+        ("Study Plans", "study_plans"),
+        ("Quiz Results", "quiz_results"),
+        ("Tutor Interactions", "tutor_interactions")
+    ]:
 
-st.sidebar.caption(
-    "Powered by Python, Streamlit, SQLite and Gemini AI"
-)
+        st.subheader(title)
+
+        records = db.get_all_records(table)
+
+        if records:
+
+            st.dataframe(
+                pd.DataFrame(records),
+                use_container_width=True,
+                hide_index=True
+            )
+
+        else:
+
+            st.info("No records available.")
+
+
+# ==================================================
+# AUTHENTICATION
+# ==================================================
+
+def authentication_page():
+
+    st.title("🎓 LearnMate AI")
+
+    st.subheader("Your Personal AI Learning Assistant")
+
+    login_tab, register_tab = st.tabs(
+        ["Login", "Register"]
+    )
+
+    with login_tab:
+        login_page()
+
+    with register_tab:
+        registration_page()
+
+
+# ==================================================
+# MAIN APPLICATION
+# ==================================================
+
+def main():
+
+    if not st.session_state.logged_in:
+
+        authentication_page()
+
+        return
+
+    user = st.session_state.user
+
+    # Defensive check for old session data.
+    if not isinstance(user, dict):
+
+        st.session_state.logged_in = False
+        st.session_state.user = None
+
+        st.warning("Please log in again.")
+        st.rerun()
+        return
+
+    st.sidebar.title("🎓 LearnMate AI")
+
+    st.sidebar.write("Welcome, " + user.get("name", "Student"))
+
+    st.sidebar.caption(user["email"])
+
+    menu = [
+        "Dashboard",
+        "7-Day AI Study Plan",
+        "AI Tutor",
+        "Diagnostic Quiz",
+        "My Activity",
+        "Change Password"
+    ]
+
+    if is_admin():
+
+        st.sidebar.divider()
+        st.sidebar.subheader("Admin Panel")
+
+        menu.extend([
+            "Registered Students",
+            "Student Learning Records",
+            "All Student Activities"
+        ])
+
+    selected_page = st.sidebar.radio(
+        "Navigation",
+        menu
+    )
+
+    st.sidebar.divider()
+
+    if st.sidebar.button("Test Gemini Connection"):
+
+        with st.spinner("Testing Gemini..."):
+
+            success, result = test_gemini()
+
+        if success:
+
+            st.sidebar.success("Gemini connected.")
+
+        else:
+
+            st.sidebar.error("Gemini connection failed.")
+            show_ai_error(result)
+
+    if st.sidebar.button("Logout"):
+
+        record_activity("Logout", "Student logged out.")
+
+        st.session_state.logged_in = False
+        st.session_state.user = None
+
+        st.rerun()
+
+    if selected_page == "Dashboard":
+        dashboard_page()
+
+    elif selected_page == "7-Day AI Study Plan":
+        study_plan_page()
+
+    elif selected_page == "AI Tutor":
+        tutor_page()
+
+    elif selected_page == "Diagnostic Quiz":
+        quiz_page()
+
+    elif selected_page == "My Activity":
+        my_activity_page()
+
+    elif selected_page == "Change Password":
+        change_password_page()
+
+    elif selected_page == "Registered Students" and is_admin():
+        registered_students_page()
+
+    elif selected_page == "Student Learning Records" and is_admin():
+        student_learning_records_page()
+
+    elif selected_page == "All Student Activities" and is_admin():
+        all_student_activities_page()
+
+    st.divider()
+
+    st.caption(
+        "LearnMate AI | Study Planner | AI Tutor | Diagnostic Quiz"
+    )
+
+
+main()
