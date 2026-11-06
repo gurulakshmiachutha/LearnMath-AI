@@ -1,268 +1,614 @@
 
 import sqlite3
+import hashlib
+import secrets
+from datetime import datetime
 
 DB_NAME = "learnmate.db"
 
 
-def get_connection():
-    conn = sqlite3.connect(DB_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ==========================================
+# DATABASE CONNECTION
+# ==========================================
 
+def connect_db():
+
+    connection = sqlite3.connect(DB_NAME)
+    connection.row_factory = sqlite3.Row
+
+    return connection
+
+
+# ==========================================
+# PASSWORD SECURITY
+# ==========================================
+
+def hash_password(password):
+
+    salt = secrets.token_hex(16)
+
+    hashed = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode(),
+        salt.encode(),
+        200000
+    ).hex()
+
+    return salt + "$" + hashed
+
+
+def check_password(password, saved_password):
+
+    try:
+
+        salt, old_hash = saved_password.split("$")
+
+        new_hash = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode(),
+            salt.encode(),
+            200000
+        ).hex()
+
+        return secrets.compare_digest(
+            new_hash,
+            old_hash
+        )
+
+    except Exception:
+
+        return False
+
+
+# ==========================================
+# DATABASE INITIALIZATION
+# ==========================================
 
 def init_db():
-    conn = get_connection()
-    cursor = conn.cursor()
+
+    connection = connect_db()
+    cursor = connection.cursor()
 
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS students (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+        CREATE TABLE IF NOT EXISTS users (
             name TEXT,
+            email TEXT UNIQUE,
+            password_hash TEXT,
+            created_at TEXT
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS otp_codes (
+            email TEXT PRIMARY KEY,
+            otp_hash TEXT,
+            expires_at TEXT,
+            attempts INTEGER DEFAULT 0
+        )
+    """)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS activity_logs (
             email TEXT,
-            course TEXT,
-            subject TEXT,
-            level TEXT,
-            study_hours INTEGER,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS quiz_results (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_email TEXT,
-            subject TEXT,
-            score INTEGER,
-            total_questions INTEGER
-        )
-    """)
-
-    cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tutor_questions (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_email TEXT,
-            subject TEXT,
-            question TEXT,
-            answer TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            activity TEXT,
+            details TEXT,
+            created_at TEXT
         )
     """)
 
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS study_plans (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            student_email TEXT,
+            email TEXT,
             subject TEXT,
+            level TEXT,
+            hours INTEGER,
             plan TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            created_at TEXT
         )
     """)
 
-    # Safely add missing columns to existing tables.
-    cursor.execute("PRAGMA table_info(study_plans)")
-    plan_columns = [row["name"] for row in cursor.fetchall()]
-
-    if "plan" not in plan_columns:
-        cursor.execute(
-            "ALTER TABLE study_plans ADD COLUMN plan TEXT"
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS quiz_results (
+            email TEXT,
+            subject TEXT,
+            score INTEGER,
+            total INTEGER,
+            created_at TEXT
         )
-
-    cursor.execute("PRAGMA table_info(study_plans)")
-    plan_columns = [row["name"] for row in cursor.fetchall()]
-
-    conn.commit()
-    conn.close()
-
-
-def save_student(name, email, subject, level, study_hours):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT id FROM students WHERE email = ?",
-        (email,)
-    )
-
-    existing = cursor.fetchone()
-
-    if existing:
-        cursor.execute("""
-            UPDATE students
-            SET name = ?, subject = ?, level = ?, study_hours = ?
-            WHERE email = ?
-        """, (name, subject, level, study_hours, email))
-    else:
-        cursor.execute("""
-            INSERT INTO students
-            (name, email, subject, level, study_hours)
-            VALUES (?, ?, ?, ?, ?)
-        """, (name, email, subject, level, study_hours))
-
-    conn.commit()
-    conn.close()
-
-
-def get_student(email):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute(
-        "SELECT * FROM students WHERE email = ?",
-        (email,)
-    )
-
-    student = cursor.fetchone()
-    conn.close()
-
-    return student
-
-
-def save_quiz_result(email, subject, score, total):
-    conn = get_connection()
-    cursor = conn.cursor()
+    """)
 
     cursor.execute("""
-        INSERT INTO quiz_results
-        (student_email, subject, score, total_questions)
-        VALUES (?, ?, ?, ?)
-    """, (email, subject, score, total))
+        CREATE TABLE IF NOT EXISTS tutor_interactions (
+            email TEXT,
+            question TEXT,
+            answer TEXT,
+            created_at TEXT
+        )
+    """)
 
-    conn.commit()
-    conn.close()
+    # Add missing columns without deleting existing records.
+    required_columns = {
+        "users": {
+            "name": "TEXT",
+            "email": "TEXT",
+            "password_hash": "TEXT",
+            "created_at": "TEXT"
+        },
+        "otp_codes": {
+            "email": "TEXT",
+            "otp_hash": "TEXT",
+            "expires_at": "TEXT",
+            "attempts": "INTEGER DEFAULT 0"
+        },
+        "activity_logs": {
+            "email": "TEXT",
+            "activity": "TEXT",
+            "details": "TEXT",
+            "created_at": "TEXT"
+        },
+        "study_plans": {
+            "email": "TEXT",
+            "subject": "TEXT",
+            "level": "TEXT",
+            "hours": "INTEGER",
+            "plan": "TEXT",
+            "created_at": "TEXT"
+        },
+        "quiz_results": {
+            "email": "TEXT",
+            "subject": "TEXT",
+            "score": "INTEGER",
+            "total": "INTEGER",
+            "created_at": "TEXT"
+        },
+        "tutor_interactions": {
+            "email": "TEXT",
+            "question": "TEXT",
+            "answer": "TEXT",
+            "created_at": "TEXT"
+        }
+    }
+
+    for table, columns in required_columns.items():
+
+        cursor.execute(f"PRAGMA table_info({table})")
+
+        existing = [
+            row["name"]
+            for row in cursor.fetchall()
+        ]
+
+        for column, data_type in columns.items():
+
+            if column not in existing:
+
+                cursor.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {column} {data_type}"
+                )
+
+    connection.commit()
+    connection.close()
 
 
-def get_quiz_results(email):
-    conn = get_connection()
-    cursor = conn.cursor()
+# ==========================================
+# USER REGISTRATION
+# ==========================================
+
+def user_exists(email):
+
+    connection = connect_db()
+    cursor = connection.cursor()
 
     cursor.execute("""
-        SELECT * FROM quiz_results
-        WHERE student_email = ?
-        ORDER BY id DESC
+        SELECT rowid
+        FROM users
+        WHERE lower(email) = lower(?)
     """, (email,))
-
-    results = cursor.fetchall()
-    conn.close()
-
-    return results
-
-
-def save_tutor_question(email, subject, question, answer):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        INSERT INTO tutor_questions
-        (student_email, subject, question, answer)
-        VALUES (?, ?, ?, ?)
-    """, (email, subject, question, answer))
-
-    conn.commit()
-    conn.close()
-
-
-def get_tutor_questions(email):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("""
-        SELECT * FROM tutor_questions
-        WHERE student_email = ?
-        ORDER BY id DESC
-    """, (email,))
-
-    questions = cursor.fetchall()
-    conn.close()
-
-    return questions
-
-
-def save_study_plan(email, subject, plan):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("PRAGMA table_info(study_plans)")
-    columns = [row["name"] for row in cursor.fetchall()]
-
-    # Support older database column names.
-    if "plan" in columns:
-        plan_column = "plan"
-    elif "study_plan" in columns:
-        plan_column = "study_plan"
-    elif "content" in columns:
-        plan_column = "content"
-    else:
-        conn.close()
-        raise Exception("No supported study plan column found.")
-
-    cursor.execute(
-        f"""
-        INSERT INTO study_plans
-        (student_email, subject, {plan_column})
-        VALUES (?, ?, ?)
-        """,
-        (email, subject, plan)
-    )
-
-    conn.commit()
-    conn.close()
-
-
-def get_latest_study_plan(email):
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    cursor.execute("PRAGMA table_info(study_plans)")
-    columns = [row["name"] for row in cursor.fetchall()]
-
-    if "plan" in columns:
-        plan_column = "plan"
-    elif "study_plan" in columns:
-        plan_column = "study_plan"
-    elif "content" in columns:
-        plan_column = "content"
-    else:
-        conn.close()
-        return None
-
-    cursor.execute(
-        f"""
-        SELECT * FROM study_plans
-        WHERE student_email = ?
-        ORDER BY id DESC
-        LIMIT 1
-        """,
-        (email,)
-    )
 
     result = cursor.fetchone()
-    conn.close()
+
+    connection.close()
+
+    return result is not None
+
+
+def create_user(name, email, password):
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    try:
+
+        cursor.execute("""
+            INSERT INTO users
+            (name, email, password_hash, created_at)
+            VALUES (?, ?, ?, ?)
+        """, (
+            name,
+            email.lower(),
+            hash_password(password),
+            datetime.now().isoformat()
+        ))
+
+        connection.commit()
+
+        return True
+
+    except sqlite3.IntegrityError:
+
+        return False
+
+    finally:
+
+        connection.close()
+
+
+# ==========================================
+# USER LOGIN
+# ==========================================
+
+def login_user(email, password):
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT rowid AS user_rowid,
+               name,
+               email,
+               password_hash,
+               created_at
+        FROM users
+        WHERE lower(email) = lower(?)
+        ORDER BY rowid DESC
+        LIMIT 1
+    """, (email,))
+
+    user = cursor.fetchone()
+
+    connection.close()
+
+    if user is None:
+        return False
+
+    user = dict(user)
+
+    saved_password = user.get("password_hash")
+
+    if not saved_password:
+        return False
+
+    if check_password(password, saved_password):
+
+        user.pop("password_hash", None)
+
+        return user
+
+    return False
+
+
+# ==========================================
+# UPDATE PASSWORD
+# ==========================================
+
+def update_password(email, new_password):
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        UPDATE users
+        SET password_hash = ?
+        WHERE lower(email) = lower(?)
+    """, (
+        hash_password(new_password),
+        email.lower()
+    ))
+
+    changed = cursor.rowcount > 0
+
+    connection.commit()
+    connection.close()
+
+    return changed
+
+
+# ==========================================
+# OTP FUNCTIONS
+# ==========================================
+
+def save_otp(email, otp_hash, expires_at):
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT OR REPLACE INTO otp_codes
+        (email, otp_hash, expires_at, attempts)
+        VALUES (?, ?, ?, 0)
+    """, (
+        email.lower(),
+        otp_hash,
+        expires_at
+    ))
+
+    connection.commit()
+    connection.close()
+
+
+def get_otp(email):
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT *
+        FROM otp_codes
+        WHERE lower(email) = lower(?)
+    """, (email,))
+
+    result = cursor.fetchone()
+
+    connection.close()
 
     if result:
-        return result[plan_column]
+        return dict(result)
 
     return None
 
 
-def update_task_status(task_id, completed):
-    conn = get_connection()
-    cursor = conn.cursor()
+def increase_otp_attempts(email):
+
+    connection = connect_db()
+    cursor = connection.cursor()
 
     cursor.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            completed INTEGER DEFAULT 0
-        )
+        UPDATE otp_codes
+        SET attempts = COALESCE(attempts, 0) + 1
+        WHERE lower(email) = lower(?)
+    """, (email,))
+
+    connection.commit()
+    connection.close()
+
+
+def delete_otp(email):
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        DELETE FROM otp_codes
+        WHERE lower(email) = lower(?)
+    """, (email,))
+
+    connection.commit()
+    connection.close()
+
+
+# ==========================================
+# ACTIVITY TRACKING
+# ==========================================
+
+def log_activity(email, activity, details=""):
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT INTO activity_logs
+        (email, activity, details, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (
+        email.lower(),
+        activity,
+        details,
+        datetime.now().isoformat()
+    ))
+
+    connection.commit()
+    connection.close()
+
+
+# ==========================================
+# STUDY PLAN RECORDS
+# ==========================================
+
+def save_study_plan(email, subject, level, hours, plan):
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT INTO study_plans
+        (email, subject, level, hours, plan, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+    """, (
+        email.lower(),
+        subject,
+        level,
+        hours,
+        plan,
+        datetime.now().isoformat()
+    ))
+
+    connection.commit()
+    connection.close()
+
+
+# ==========================================
+# QUIZ RECORDS
+# ==========================================
+
+def save_quiz_result(email, subject, score, total):
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT INTO quiz_results
+        (email, subject, score, total, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (
+        email.lower(),
+        subject,
+        score,
+        total,
+        datetime.now().isoformat()
+    ))
+
+    connection.commit()
+    connection.close()
+
+
+# ==========================================
+# AI TUTOR RECORDS
+# ==========================================
+
+def save_tutor_interaction(email, question, answer):
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        INSERT INTO tutor_interactions
+        (email, question, answer, created_at)
+        VALUES (?, ?, ?, ?)
+    """, (
+        email.lower(),
+        question,
+        answer,
+        datetime.now().isoformat()
+    ))
+
+    connection.commit()
+    connection.close()
+
+
+# ==========================================
+# REGISTERED STUDENTS
+# ==========================================
+
+def get_all_users():
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute("""
+        SELECT
+            name,
+            email,
+            created_at
+        FROM users
+        ORDER BY rowid DESC
     """)
 
+    result = [
+        dict(row)
+        for row in cursor.fetchall()
+    ]
+
+    connection.close()
+
+    return result
+
+
+# ==========================================
+# STUDENT RECORDS
+# ==========================================
+
+def get_user_records(table, email):
+
+    allowed_tables = [
+        "activity_logs",
+        "study_plans",
+        "quiz_results",
+        "tutor_interactions"
+    ]
+
+    if table not in allowed_tables:
+        return []
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        f"""
+        SELECT rowid AS record_number, *
+        FROM {table}
+        WHERE lower(email) = lower(?)
+        ORDER BY rowid DESC
+        """,
+        (email,)
+    )
+
+    result = [
+        dict(row)
+        for row in cursor.fetchall()
+    ]
+
+    connection.close()
+
+    return result
+
+
+# ==========================================
+# ALL STUDENT RECORDS
+# ==========================================
+
+def get_all_records(table):
+
+    allowed_tables = [
+        "activity_logs",
+        "study_plans",
+        "quiz_results",
+        "tutor_interactions"
+    ]
+
+    if table not in allowed_tables:
+        return []
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
+    cursor.execute(
+        f"""
+        SELECT rowid AS record_number, *
+        FROM {table}
+        ORDER BY rowid DESC
+        """
+    )
+
+    result = [
+        dict(row)
+        for row in cursor.fetchall()
+    ]
+
+    connection.close()
+
+    return result
+
+
+# ==========================================
+# TOTAL STUDENTS
+# ==========================================
+
+def get_user_count():
+
+    connection = connect_db()
+    cursor = connection.cursor()
+
     cursor.execute("""
-        UPDATE tasks
-        SET completed = ?
-        WHERE id = ?
-    """, (int(completed), task_id))
+        SELECT COUNT(*)
+        FROM users
+    """)
 
-    conn.commit()
-    conn.close()
+    count = cursor.fetchone()[0]
+
+    connection.close()
+
+    return count
 
 
+# Initialize database when imported.
 init_db()
